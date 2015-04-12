@@ -19,18 +19,29 @@
 
 extern struct config *gcfg;
 
+static inline uint16_t swap_u16(uint16_t val)
+{
+	return (val << 8) | (val >> 8);
+}
+
+static inline uint32_t swap_u32(uint32_t val)
+{
+	val = ((val << 8) & 0xff00ff00) | ((val >> 8) & 0xff00ff);
+	return (val << 16) | (val >> 16);
+}
+
 static uint16_t ip_checksum(void *d, int c)
 {
 	uint32_t sum = 0xffff;
 	uint16_t *p = d;
 
 	while (c > 1) {
-		sum += *p++;
+		sum += swap_u16(ntohs(*p++));
 		c -= 2;
 	}
 
 	if (c)
-		sum += htons(*((uint8_t *)p) << 8);
+		sum += swap_u16(*((uint8_t *)p) << 8);
 
 	while (sum > 0xffff)
 		sum = (sum & 0xffff) + (sum >> 16);
@@ -52,10 +63,10 @@ static uint16_t ip6_checksum(struct ip6 *ip6, uint32_t data_len, uint8_t proto)
 	int i;
 
 	for (i = 0, p = ip6->src.s6_addr16; i < 16; ++i)
-		sum += *p++;
-	sum += htonl(data_len) >> 16;
-	sum += htonl(data_len) & 0xffff;
-	sum += htons(proto);
+		sum += swap_u16(ntohs(*p++));
+	sum += swap_u32(data_len) >> 16;
+	sum += swap_u32(data_len) & 0xffff;
+	sum += swap_u16(proto);
 
 	while (sum > 0xffff)
 		sum = (sum & 0xffff) + (sum >> 16);
@@ -107,11 +118,11 @@ static void host_send_icmp4(uint8_t tos, struct in_addr *src,
 	header.ip4.cksum = 0;
 	header.ip4.src = *src;
 	header.ip4.dest = *dest;
-	header.ip4.cksum = ip_checksum(&header.ip4, sizeof(header.ip4));
+	header.ip4.cksum = htons(swap_u16(ip_checksum(&header.ip4, sizeof(header.ip4))));
 	header.icmp = *icmp;
 	header.icmp.cksum = 0;
-	header.icmp.cksum = ones_add(ip_checksum(data, data_len),
-			ip_checksum(&header.icmp, sizeof(header.icmp)));
+	header.icmp.cksum = htons(swap_u16(ones_add(ip_checksum(data, data_len),
+			ip_checksum(&header.icmp, sizeof(header.icmp)))));
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
 	iov[1].iov_base = data;
@@ -175,15 +186,15 @@ static int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6)
 
 	switch (p->data_proto) {
 	case 1:
-		cksum = ip6_checksum(ip6, htons(p->ip4->length) -
+		cksum = ip6_checksum(ip6, ntohs(p->ip4->length) -
 						p->header_len, 58);
-		cksum = ones_add(p->icmp->cksum, cksum);
+		cksum = ones_add(swap_u16(ntohs(p->icmp->cksum)), cksum);
 		if (p->icmp->type == 8) {
 			p->icmp->type = 128;
-			p->icmp->cksum = ones_add(cksum, ~(128 - 8));
+			p->icmp->cksum = htons(swap_u16(ones_add(cksum, ~(128 - 8))));
 		} else {
 			p->icmp->type = 129;
-			p->icmp->cksum = ones_add(cksum, ~(129 - 0));
+			p->icmp->cksum = htons(swap_u16(ones_add(cksum, ~(129 - 0))));
 		}
 		return 0;
 	case 17:
@@ -507,12 +518,12 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	--header.ip6.hop_limit;
 
 	header.icmp.cksum = 0;
-	header.icmp.cksum = ones_add(ip6_checksum(&header.ip6,
+	header.icmp.cksum = htons(swap_u16(ones_add(ip6_checksum(&header.ip6,
 					ntohs(header.ip6.payload_length), 58),
 			ones_add(ip_checksum(&header.icmp,
 						sizeof(header.icmp) +
 						sizeof(header.ip6_em)),
-				ip_checksum(p_em.data, p_em.data_len)));
+				ip_checksum(p_em.data, p_em.data_len)))));
 
 	header.pi.flags = 0;
 	header.pi.proto = htons(ETH_P_IPV6);
@@ -576,11 +587,11 @@ static void host_send_icmp6(uint8_t tc, struct in6_addr *src,
 	header.ip6.dest = *dest;
 	header.icmp = *icmp;
 	header.icmp.cksum = 0;
-	header.icmp.cksum = ones_add(ip_checksum(data, data_len),
-			ip_checksum(&header.icmp, sizeof(header.icmp)));
-	header.icmp.cksum = ones_add(header.icmp.cksum,
+	header.icmp.cksum = htons(swap_u16(ones_add(ip_checksum(data, data_len),
+			ip_checksum(&header.icmp, sizeof(header.icmp)))));
+	header.icmp.cksum = htons(swap_u16(ones_add(swap_u16(ntohs(header.icmp.cksum)),
 			ip6_checksum(&header.ip6,
-					data_len + sizeof(header.icmp), 58));
+					data_len + sizeof(header.icmp), 58))));
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
 	iov[1].iov_base = data;
@@ -663,15 +674,15 @@ static int xlate_payload_6to4(struct pkt *p, struct ip4 *ip4)
 
 	switch (p->data_proto) {
 	case 58:
-		cksum = ~ip6_checksum(p->ip6, htons(p->ip6->payload_length) -
+		cksum = ~ip6_checksum(p->ip6, ntohs(p->ip6->payload_length) -
 							p->header_len, 58);
-		cksum = ones_add(p->icmp->cksum, cksum);
+		cksum = ones_add(swap_u16(ntohs(p->icmp->cksum)), cksum);
 		if (p->icmp->type == 128) {
 			p->icmp->type = 8;
-			p->icmp->cksum = ones_add(cksum, 128 - 8);
+			p->icmp->cksum = htons(swap_u16(ones_add(cksum, 128 - 8)));
 		} else {
 			p->icmp->type = 0;
-			p->icmp->cksum = ones_add(cksum, 129 - 0);
+			p->icmp->cksum = htons(swap_u16(ones_add(cksum, 129 - 0)));
 		}
 		return 0;
 	case 17:
@@ -731,7 +742,7 @@ static void xlate_6to4_data(struct pkt *p)
 	header.pi.flags = 0;
 	header.pi.proto = htons(ETH_P_IP);
 
-	header.ip4.cksum = ip_checksum(&header.ip4, sizeof(header.ip4));
+	header.ip4.cksum = htons(swap_u16(ip_checksum(&header.ip4, sizeof(header.ip4))));
 
 	iov[0].iov_base = &header;
 	iov[0].iov_len = sizeof(header);
@@ -908,7 +919,7 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 		ntohs(p_em.ip6->payload_length) - p_em.header_len, NULL);
 
 	header.ip4_em.cksum =
-		ip_checksum(&header.ip4_em, sizeof(header.ip4_em));
+		htons(swap_u16(ip_checksum(&header.ip4_em, sizeof(header.ip4_em))));
 
 	if (map_ip6_to_ip4(&header.ip4.src, &p->ip6->src, NULL, 0)) {
 		if (allow_fake_source)
@@ -924,13 +935,13 @@ static void xlate_6to4_icmp_error(struct pkt *p)
 				sizeof(header.ip4_em) + p_em.data_len, NULL);
 	--header.ip4.ttl;
 
-	header.ip4.cksum = ip_checksum(&header.ip4, sizeof(header.ip4));
+	header.ip4.cksum = htons(swap_u16(ip_checksum(&header.ip4, sizeof(header.ip4))));
 
 	header.icmp.cksum = 0;
-	header.icmp.cksum = ones_add(ip_checksum(&header.icmp,
+	header.icmp.cksum = htons(swap_u16(ones_add(ip_checksum(&header.icmp,
 							sizeof(header.icmp) +
 							sizeof(header.ip4_em)),
-				ip_checksum(p_em.data, p_em.data_len));
+				ip_checksum(p_em.data, p_em.data_len))));
 
 	header.pi.flags = 0;
 	header.pi.proto = htons(ETH_P_IP);
