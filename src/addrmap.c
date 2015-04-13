@@ -1,6 +1,8 @@
 /*
  *  addrmap.c -- address mapping routines
  *
+ *  Copyright (C) 2015 Jianying Liu <rssnsj@gmail.com>
+ *
  *  part of TAYGA <http://www.litech.org/tayga/>
  *  Copyright (C) 2010  Nathan Lutchansky <lutchann@litech.org>
  *
@@ -14,296 +16,158 @@
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
  */
+#include <linux/kernel.h>
+#include <linux/inet.h>
+#include <linux/types.h>
+#include <asm/param.h>
+#include <asm/byteorder.h>
+#include <linux/netdevice.h>
+#include <linux/kthread.h>
+#include <linux/sched.h>
+#include "tayga.h"
 
-#include <tayga.h>
+#define ADDRMAP_HASH_BITS  14
 
-extern struct config *gcfg;
-extern time_t now;
+struct addrmap_bucket {
+	struct list_head chain;
+	spinlock_t lock;
+};
 
-int validate_ip4_addr(const struct in_addr *a)
+struct addrmap_table {
+	struct addrmap_bucket base4[1 << ADDRMAP_HASH_BITS];
+	struct addrmap_bucket base6[1 << ADDRMAP_HASH_BITS];
+	size_t hash_size;
+	struct list_head idle_queue;
+	spinlock_t idle_lock;
+	/* Number of unassigned IPv4 addresses in divided sections */
+	size_t *free_count;
+	size_t free_count_rows;
+};
+
+struct addrmap {
+	struct list_head list6;
+	struct list_head list4;
+	struct list_head idle_list;
+	struct in_addr addr4;
+	struct in6_addr addr6;
+	struct addrmap_bucket *bucket6;
+	struct addrmap_bucket *bucket4;
+	unsigned long last_use;
+	struct rcu_head rcu;
+};
+
+static struct addrmap_table g_addrmap_tbl;
+
+static inline u32 hash_ip4(const struct in_addr *addr4)
 {
-	/* First octet == 0 */
-	if (!(a->s_addr & htonl(0xff000000)))
-		return -1;
-
-	/* First octet == 127 */
-	if ((a->s_addr & htonl(0xff000000)) == htonl(0x7f000000))
-		return -1;
-
-	/* Link-local block 169.254.0.0/16 */
-	if ((a->s_addr & htonl(0xffff0000)) == htonl(0xa9fe0000))
-		return -1;
-
-	/* Class D & E */
-	if ((a->s_addr & htonl(0xe0000000)) == htonl(0xe0000000))
-		return -1;
-
-	return 0;
+	return (u32)(addr4->s_addr * gcfg.rand[0]);
 }
 
-int validate_ip6_addr(const struct in6_addr *a)
+static inline u32 hash_ip6(const struct in6_addr *addr6)
 {
-	/* Well-known prefix for NAT64 */
-	if (a->s6_addr32[0] == WKPF && !a->s6_addr32[1] && !a->s6_addr32[2])
-		return 0;
+	u32 h;
 
-	/* Reserved per RFC 2373 */
-	if (!a->s6_addr[0])
-		return -1;
-
-	/* Multicast addresses */
-	if (a->s6_addr[0] == 0xff)
-		return -1;
-
-	/* Link-local unicast addresses */
-	if ((a->s6_addr16[0] & htons(0xffc0)) == htons(0xfe80))
-		return -1;
-
-	return 0;
+	h = ((u32)addr6->s6_addr16[0] + gcfg.rand[0]) *
+		((u32)addr6->s6_addr16[1] + gcfg.rand[1]);
+	h ^= ((u32)addr6->s6_addr16[2] + gcfg.rand[2]) *
+		((u32)addr6->s6_addr16[3] + gcfg.rand[3]);
+	h ^= ((u32)addr6->s6_addr16[4] + gcfg.rand[4]) *
+		((u32)addr6->s6_addr16[5] + gcfg.rand[5]);
+	h ^= ((u32)addr6->s6_addr16[6] + gcfg.rand[6]) *
+		((u32)addr6->s6_addr16[7] + gcfg.rand[7]);
+	return h;
 }
 
-int is_private_ip4_addr(const struct in_addr *a)
+
+static inline void consume_dynamic_ip(
+		const struct in_addr *addr4)
 {
-	/* 10.0.0.0/8 */
-	if ((a->s_addr & htonl(0xff000000)) == htonl(0x0a000000))
-		return -1;
-
-	/* 172.16.0.0/12 */
-	if ((a->s_addr & htonl(0xfff00000)) == htonl(0xac100000))
-		return -1;
-
-	/* 192.0.2.0/24 */
-	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc0000200))
-		return -1;
-
-	/* 192.168.0.0/16 */
-	if ((a->s_addr & htonl(0xffff0000)) == htonl(0xc0a80000))
-		return -1;
-
-	/* 198.18.0.0/15 */
-	if ((a->s_addr & htonl(0xfffe0000)) == htonl(0xc6120000))
-		return -1;
-
-	/* 198.51.100.0/24 */
-	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xc6336400))
-		return -1;
-
-	/* 203.0.113.0/24 */
-	if ((a->s_addr & htonl(0xffffff00)) == htonl(0xcb007100))
-		return -1;
-
-	return 0;
+	u32 base = ntohl(addr4->s_addr) - ntohl(gcfg.dynamic_pool.s_addr);
+	int row = base / g_addrmap_tbl.free_count_rows;
+	g_addrmap_tbl.free_count[row]--;
 }
 
-int calc_ip4_mask(struct in_addr *mask, const struct in_addr *addr, int len)
+static inline void release_dynamic_ip(
+		const struct in_addr *addr4)
 {
-	mask->s_addr = htonl(~((1 << (32 - len)) - 1));
-	if (addr && (addr->s_addr & ~mask->s_addr))
-		return -1;
-	return 0;
-
+	u32 base = ntohl(addr4->s_addr) - ntohl(gcfg.dynamic_pool.s_addr);
+	int row = base / g_addrmap_tbl.free_count_rows;
+	g_addrmap_tbl.free_count[row]++;
 }
 
-int calc_ip6_mask(struct in6_addr *mask, const struct in6_addr *addr, int len)
+static struct addrmap *alloc_addrmap(const struct in6_addr *addr6,
+	struct in_addr *addr4)
 {
-	if (len > 32) {
-		mask->s6_addr32[0] = ~0;
-		if (len > 64) {
-			mask->s6_addr32[1] = ~0;
-			if (len > 96) {
-				mask->s6_addr32[2] = ~0;
-				mask->s6_addr32[3] =
-					htonl(~((1 << (128 - len)) - 1));
-			} else {
-				mask->s6_addr32[2] =
-					htonl(~((1 << (96 - len)) - 1));
-				mask->s6_addr32[3] = 0;
-			}
-		} else {
-			mask->s6_addr32[1] = htonl(~((1 << (64 - len)) - 1));
-			mask->s6_addr32[2] = 0;
-			mask->s6_addr32[3] = 0;
-		}
-	} else {
-		mask->s6_addr32[0] = htonl(~((1 << (32 - len)) - 1));
-		mask->s6_addr32[1] = 0;
-		mask->s6_addr32[2] = 0;
-		mask->s6_addr32[3] = 0;
-	}
-	if (!addr)
-		return 0;
-	if ((addr->s6_addr32[0] & ~mask->s6_addr32[0]) ||
-			(addr->s6_addr32[1] & ~mask->s6_addr32[1]) ||
-			(addr->s6_addr32[2] & ~mask->s6_addr32[2]) ||
-			(addr->s6_addr32[3] & ~mask->s6_addr32[3]))
-		return -1;
-	return 0;
-}
+	struct addrmap *map;
 
-static uint32_t hash_ip4(const struct in_addr *addr4)
-{
-	return ((uint32_t)(addr4->s_addr *
-				gcfg->rand[0])) >> (32 - gcfg->hash_bits);
-}
-
-static uint32_t hash_ip6(const struct in6_addr *addr6)
-{
-	uint32_t h;
-
-	h = ((uint32_t)addr6->s6_addr16[0] + gcfg->rand[0]) *
-		((uint32_t)addr6->s6_addr16[1] + gcfg->rand[1]);
-	h ^= ((uint32_t)addr6->s6_addr16[2] + gcfg->rand[2]) *
-		((uint32_t)addr6->s6_addr16[3] + gcfg->rand[3]);
-	h ^= ((uint32_t)addr6->s6_addr16[4] + gcfg->rand[4]) *
-		((uint32_t)addr6->s6_addr16[5] + gcfg->rand[5]);
-	h ^= ((uint32_t)addr6->s6_addr16[6] + gcfg->rand[6]) *
-		((uint32_t)addr6->s6_addr16[7] + gcfg->rand[7]);
-	return h >> (32 - gcfg->hash_bits);
-}
-
-static void add_to_hash_table(struct cache_entry *c, uint32_t hash4,
-		uint32_t hash6)
-{
-	list_add(&c->hash4, &gcfg->hash_table4[hash4]);
-	list_add(&c->hash6, &gcfg->hash_table6[hash6]);
-}
-
-void create_cache(void)
-{
-	int i, hash_size = 1 << gcfg->hash_bits;
-	struct list_head *entry;
-	struct cache_entry *c;
-
-	if (gcfg->hash_table4) {
-		free(gcfg->hash_table4);
-		free(gcfg->hash_table6);
-	}
-
-	gcfg->hash_table4 = (struct list_head *)
-				malloc(hash_size * sizeof(struct list_head));
-	gcfg->hash_table6 = (struct list_head *)
-				malloc(hash_size * sizeof(struct list_head));
-	if (!gcfg->hash_table4 || !gcfg->hash_table6) {
-		slog(LOG_CRIT, "unable to allocate %d bytes for hash table\n",
-				hash_size * sizeof(struct list_head));
-		exit(1);
-	}
-	for (i = 0; i < hash_size; ++i) {
-		INIT_LIST_HEAD(&gcfg->hash_table4[i]);
-		INIT_LIST_HEAD(&gcfg->hash_table6[i]);
-	}
-
-	if (list_empty(&gcfg->cache_pool) && list_empty(&gcfg->cache_active)) {
-		c = calloc(gcfg->cache_size, sizeof(struct cache_entry));
-		for (i = 0; i < gcfg->cache_size; ++i) {
-			INIT_LIST_HEAD(&c->list);
-			INIT_LIST_HEAD(&c->hash4);
-			INIT_LIST_HEAD(&c->hash6);
-			list_add_tail(&c->list, &gcfg->cache_pool);
-			++c;
-		}
-	} else {
-		list_for_each(entry, &gcfg->cache_active) {
-			c = list_entry(entry, struct cache_entry, list);
-			INIT_LIST_HEAD(&c->hash4);
-			INIT_LIST_HEAD(&c->hash6);
-			add_to_hash_table(c, hash_ip4(&c->addr4),
-						hash_ip6(&c->addr6));
-		}
-	}
-}
-
-static struct cache_entry *cache_insert(const struct in_addr *addr4,
-		const struct in6_addr *addr6,
-		uint32_t hash4, uint32_t hash6)
-{
-	struct cache_entry *c;
-
-	if (list_empty(&gcfg->cache_pool))
+	if (!(map = kmalloc(sizeof(struct addrmap), GFP_ATOMIC)))
 		return NULL;
-	c = list_entry(gcfg->cache_pool.next, struct cache_entry, list);
-	c->addr4 = *addr4;
-	c->addr6 = *addr6;
-	c->last_use = now;
-	c->flags = 0;
-	c->ip4_ident = 1;
-	list_add(&c->list, &gcfg->cache_active);
-	add_to_hash_table(c, hash4, hash6);
-	return c;
+	init_list_entry(&map->list4);
+	init_list_entry(&map->list6);
+	init_list_entry(&map->idle_list);
+	map->addr6 = *addr6;
+	map->addr4 = *addr4;
+	map->last_use = jiffies;
+	INIT_RCU_HEAD(&map->rcu);	
+	return map;
 }
 
-struct map4 *find_map4(const struct in_addr *addr4)
+static void __free_addrmap_rcu(struct rcu_head *rcu)
 {
-	struct list_head *entry;
-	struct map4 *m;
-
-	list_for_each(entry, &gcfg->map4_list) {
-		m = list_entry(entry, struct map4, list);
-		if (m->addr.s_addr == (m->mask.s_addr & addr4->s_addr))
-			return m;
-	}
-	return NULL;
+	struct addrmap *map = container_of(rcu, struct addrmap, rcu);
+	kfree(map);
 }
 
-struct map6 *find_map6(const struct in6_addr *addr6)
+static void free_addrmap_rcu(struct addrmap *map)
 {
-	struct list_head *entry;
-	struct map6 *m;
+	/*
+	 * NOTICE: Caller must ensure 'map' was already removed
+	 *  from two hash tables and the idle_queue.
+	 */
+	char s_addr4[20];
 
-	list_for_each(entry, &gcfg->map6_list) {
-		m = list_entry(entry, struct map6, list);
-		if (IN6_IS_IN_NET(addr6, &m->addr, &m->mask))
-			return m;
-	}
-	return NULL;
+	release_dynamic_ip(&map->addr4);
+	call_rcu(&map->rcu, __free_addrmap_rcu);
+
+	printk("tayga: Recycled address %s\n",
+			simple_inet_ntoa(&map->addr4, s_addr4));
 }
 
-int insert_map4(struct map4 *m, struct map4 **conflict)
+static void free_addrmap(struct addrmap *map)
 {
-	struct list_head *entry;
-	struct map4 *s;
-
-	list_for_each(entry, &gcfg->map4_list) {
-		s = list_entry(entry, struct map4, list);
-		if (s->prefix_len < m->prefix_len)
-			break;
-		if (s->prefix_len == m->prefix_len &&
-				s->addr.s_addr == m->addr.s_addr)
-			goto conflict;
-	}
-	list_add_tail(&m->list, entry);
-	return 0;
-
-conflict:
-	if (conflict)
-		*conflict = s;
-	return -1;
+	release_dynamic_ip(&map->addr4);
+	kfree(map);
 }
 
-int insert_map6(struct map6 *m, struct map6 **conflict)
+static void touch_addrmap(struct addrmap *map)
 {
-	struct list_head *entry, *insert_pos = NULL;
-	struct map6 *s;
+	struct addrmap_table *tbl = &g_addrmap_tbl;
 
-	list_for_each(entry, &gcfg->map6_list) {
-		s = list_entry(entry, struct map6, list);
-		if (s->prefix_len < m->prefix_len) {
-			if (IN6_IS_IN_NET(&m->addr, &s->addr, &s->mask))
-				goto conflict;
-			if (!insert_pos)
-				insert_pos = entry;
-		} else {
-			if (IN6_IS_IN_NET(&s->addr, &m->addr, &m->mask))
-				goto conflict;
-		}
+	/* Update its idle_list order with minimum interval: 5s */
+	if (jiffies - map->last_use < HZ * 5)
+		return;
+
+	map->last_use = jiffies;
+	spin_lock_bh(&tbl->idle_lock);
+	/* Might be removed from idle_queue after got from hash table. */
+	if (!list_entry_orphan(&map->idle_list)) {
+		list_del_rcu(&map->idle_list);
+		list_add_tail_rcu(&map->idle_list, &tbl->idle_queue);
 	}
-	list_add_tail(&m->list, insert_pos ? insert_pos : &gcfg->map6_list);
-	return 0;
+	spin_unlock_bh(&tbl->idle_lock);
+}
 
-conflict:
-	if (conflict)
-		*conflict = s;
-	return -1;
+static bool is_ip4_assigned(const struct in_addr *addr4)
+{
+	struct addrmap_bucket *bucket4 = &g_addrmap_tbl.base4[
+		hash_ip4(addr4) & (g_addrmap_tbl.hash_size - 1)];
+	struct addrmap *map;
+	
+	list_for_each_entry_rcu (map, &bucket4->chain, list4) {
+		if (addr4->s_addr == map->addr4.s_addr)
+			return true;
+	}
+	return false;
 }
 
 int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
@@ -318,60 +182,56 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
 		return 0;
 	case 40:
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr6->s6_addr32[1] = prefix->s6_addr32[1] |
 					(addr4->s_addr >> 8);
 		addr6->s6_addr32[2] = (addr4->s_addr << 16) & 0x00ff0000;
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr6->s6_addr32[1] = prefix->s6_addr32[1] |
 					(addr4->s_addr << 8);
 		addr6->s6_addr32[2] = (addr4->s_addr >> 16) & 0x0000ff00;
-# endif
 #endif
 		addr6->s6_addr32[3] = 0;
 		return 0;
 	case 48:
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr6->s6_addr32[1] = prefix->s6_addr32[1] |
 					(addr4->s_addr >> 16);
 		addr6->s6_addr32[2] = (addr4->s_addr << 8) & 0x00ffff00;
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr6->s6_addr32[1] = prefix->s6_addr32[1] |
 					(addr4->s_addr << 16);
 		addr6->s6_addr32[2] = (addr4->s_addr >> 8) & 0x00ffff00;
-# endif
 #endif
 		addr6->s6_addr32[3] = 0;
 		return 0;
 	case 56:
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr6->s6_addr32[1] = prefix->s6_addr32[1] |
 					(addr4->s_addr >> 24);
 		addr6->s6_addr32[2] = addr4->s_addr & 0x00ffffff;
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr6->s6_addr32[1] = prefix->s6_addr32[1] |
 					(addr4->s_addr << 24);
 		addr6->s6_addr32[2] = addr4->s_addr & 0xffffff00;
-# endif
 #endif
 		addr6->s6_addr32[3] = 0;
 		return 0;
 	case 64:
 		addr6->s6_addr32[0] = prefix->s6_addr32[0];
 		addr6->s6_addr32[1] = prefix->s6_addr32[1];
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr6->s6_addr32[2] = addr4->s_addr >> 8;
 		addr6->s6_addr32[3] = addr4->s_addr << 24;
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr6->s6_addr32[2] = addr4->s_addr << 8;
 		addr6->s6_addr32[3] = addr4->s_addr >> 24;
-# endif
 #endif
 		return 0;
 	case 96:
@@ -388,73 +248,6 @@ int append_to_prefix(struct in6_addr *addr6, const struct in_addr *addr4,
 	}
 }
 
-int map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4,
-		struct cache_entry **c_ptr)
-{
-	uint32_t hash;
-	struct list_head *entry;
-	struct cache_entry *c;
-	struct map4 *map4;
-	struct map_static *s;
-	struct map_dynamic *d = NULL;
-
-	if (gcfg->cache_size) {
-		hash = hash_ip4(addr4);
-
-		list_for_each(entry, &gcfg->hash_table4[hash]) {
-			c = list_entry(entry, struct cache_entry, hash4);
-			if (addr4->s_addr == c->addr4.s_addr) {
-				*addr6 = c->addr6;
-				c->last_use = now;
-				if (c_ptr)
-					*c_ptr = c;
-				return 0;
-			}
-		}
-	}
-
-	map4 = find_map4(addr4);
-
-	if (!map4)
-		return -1;
-
-	switch (map4->type) {
-	case MAP_TYPE_STATIC:
-		s = container_of(map4, struct map_static, map4);
-		*addr6 = s->map6.addr;
-		break;
-	case MAP_TYPE_RFC6052:
-		s = container_of(map4, struct map_static, map4);
-		if (append_to_prefix(addr6, addr4, &s->map6.addr,
-					s->map6.prefix_len) < 0)
-			return -1;
-		break;
-	case MAP_TYPE_DYNAMIC_POOL:
-		return -1;
-	case MAP_TYPE_DYNAMIC_HOST:
-		d = container_of(map4, struct map_dynamic, map4);
-		*addr6 = d->map6.addr;
-		d->last_use = now;
-		break;
-	default:
-		return -1;
-	}
-
-	if (gcfg->cache_size) {
-		c = cache_insert(addr4, addr6, hash, hash_ip6(addr6));
-
-		if (c_ptr)
-			*c_ptr = c;
-		if (d) {
-			d->cache_entry = c;
-			if (c)
-				c->flags |= CACHE_F_REP_AGEOUT;
-		}
-	}
-
-	return 0;
-}
-
 static int extract_from_prefix(struct in_addr *addr4,
 		const struct in6_addr *addr6, int prefix_len)
 {
@@ -468,54 +261,50 @@ static int extract_from_prefix(struct in_addr *addr4,
 		if (addr6->s6_addr32[2] & htonl(0xff00ffff) ||
 				addr6->s6_addr32[3])
 			return -1;
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr4->s_addr = (addr6->s6_addr32[1] << 8) | addr6->s6_addr[9];
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr4->s_addr = (addr6->s6_addr32[1] >> 8) |
 				(addr6->s6_addr32[2] << 16);
-# endif
 #endif
 		break;
 	case 48:
 		if (addr6->s6_addr32[2] & htonl(0xff0000ff) ||
 				addr6->s6_addr32[3])
 			return -1;
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr4->s_addr = (addr6->s6_addr16[3] << 16) |
 				(addr6->s6_addr32[2] >> 8);
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr4->s_addr = addr6->s6_addr16[3] |
 				(addr6->s6_addr32[2] << 8);
-# endif
 #endif
 		break;
 	case 56:
 		if (addr6->s6_addr[8] || addr6->s6_addr32[3])
 			return -1;
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr4->s_addr = (addr6->s6_addr[7] << 24) |
 				addr6->s6_addr32[2];
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr4->s_addr = addr6->s6_addr[7] |
 				addr6->s6_addr32[2];
-# endif
 #endif
 		break;
 	case 64:
 		if (addr6->s6_addr[8] ||
 				addr6->s6_addr32[3] & htonl(0x00ffffff))
 			return -1;
-#if __BYTE_ORDER == __BIG_ENDIAN
+#ifdef __BIG_ENDIAN
 		addr4->s_addr = (addr6->s6_addr32[2] << 8) |
 				addr6->s6_addr[12];
-#else
-# if __BYTE_ORDER == __LITTLE_ENDIAN
+#endif
+#ifdef __LITTLE_ENDIAN
 		addr4->s_addr = (addr6->s6_addr32[2] >> 8) |
 				(addr6->s6_addr32[3] << 24);
-# endif
 #endif
 		break;
 	case 96:
@@ -527,105 +316,259 @@ static int extract_from_prefix(struct in_addr *addr4,
 	return validate_ip4_addr(addr4);
 }
 
-int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *addr6,
-		struct cache_entry **c_ptr, int dyn_alloc)
+int __map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 {
-	uint32_t hash;
-	struct list_head *entry;
-	struct cache_entry *c;
-	struct map6 *map6;
-	struct map_static *s;
-	struct map_dynamic *d = NULL;
+	struct addrmap_bucket *bucket4;
+	struct addrmap *map;
 
-	if (gcfg->cache_size) {
-		hash = hash_ip6(addr6);
+	if (!IN4_IS_IN_NET(addr4, &gcfg.dynamic_pool, &gcfg.dynamic_mask))
+		return append_to_prefix(addr6, addr4, &gcfg.prefix, gcfg.prefix_len);
 
-		list_for_each(entry, &gcfg->hash_table6[hash]) {
-			c = list_entry(entry, struct cache_entry, hash6);
-			if (IN6_ARE_ADDR_EQUAL(addr6, &c->addr6)) {
-				*addr4 = c->addr4;
-				c->last_use = now;
-				if (c_ptr)
-					*c_ptr = c;
-				return 0;
-			}
+	bucket4 = &g_addrmap_tbl.base4[hash_ip4(addr4) &
+			(g_addrmap_tbl.hash_size - 1)];
+	list_for_each_entry_rcu (map, &bucket4->chain, list4) {
+		if (addr4->s_addr == map->addr4.s_addr) {
+			*addr6 = map->addr6;
+			touch_addrmap(map);
+			return 0;
 		}
 	}
 
-	map6 = find_map6(addr6);
+	return -1;
+}
 
-	if (!map6) {
-		if (dyn_alloc)
-			map6 = assign_dynamic(addr6);
-		if (!map6)
+int __map_ip6_to_ip4(struct in_addr *addr4,
+	const struct in6_addr *addr6, int dyn_alloc)
+{
+	struct addrmap *map;
+	u32 base, max;
+	struct addrmap_bucket *bucket6, *bucket4;
+	struct in_addr assigned_ip4 = { 0 };
+	int i, row, col, tot_cols;
+	char s_addr4[20], s_addr6[40];
+
+	/* NAT64 address conversion */
+	if (IN6_IS_IN_NET(addr6, &gcfg.prefix, &gcfg.prefix_mask)) {
+		if (extract_from_prefix(addr4, addr6, gcfg.prefix_len) < 0)
 			return -1;
+		return 0;
 	}
 
-	switch (map6->type) {
-	case MAP_TYPE_STATIC:
-		s = container_of(map6, struct map_static, map6);
-		*addr4 = s->map4.addr;
-		break;
-	case MAP_TYPE_RFC6052:
-		if (extract_from_prefix(addr4, addr6, map6->prefix_len) < 0)
-			return -1;
-		if (map6->addr.s6_addr32[0] == WKPF &&
-				is_private_ip4_addr(addr4))
-			return -1;
-		s = container_of(map6, struct map_static, map6);
-		if (find_map4(addr4) != &s->map4)
-			return -1;
-		break;
-	case MAP_TYPE_DYNAMIC_HOST:
-		d = container_of(map6, struct map_dynamic, map6);
-		*addr4 = d->map4.addr;
-		d->last_use = now;
-		break;
-	default:
+	if (!dyn_alloc)
+		return -1;
+
+	/* Search in dynamic pool hash table */
+	bucket6 = &g_addrmap_tbl.base6[hash_ip6(addr6) &
+		(g_addrmap_tbl.hash_size - 1)];
+	list_for_each_entry_rcu (map, &bucket6->chain, list6) {
+		if (IN6_ARE_ADDR_EQUAL(addr6, &map->addr6)) {
+			*addr4 = map->addr4;
+			touch_addrmap(map);
+			return 0;
+		}
+	}
+
+	/* Not cached, create it */
+	spin_lock_bh(&bucket6->lock);
+	
+	/* Search again to ensure the entry does not exist */
+	list_for_each_entry (map, &bucket6->chain, list6) {
+		if (IN6_ARE_ADDR_EQUAL(addr6, &map->addr6)) {
+			spin_unlock_bh(&bucket6->lock);
+			*addr4 = map->addr4;
+			return 0;
+		}
+	}
+
+	/* Assign IPv4 address from pool for IPv6 source address */
+	base = 0;
+	max = (1 << (32 - gcfg.dynamic_pfxlen)) - 1;
+	for (i = 0; i < 4; i++) {
+		base += ntohl(addr6->s6_addr32[i]);
+		while (base & ~max) {
+			base = (base & max) +
+				(base >> (32 - gcfg.dynamic_pfxlen));
+		}
+	}
+	tot_cols = (1 << (32 - gcfg.dynamic_pfxlen)) / g_addrmap_tbl.free_count_rows;
+	row = base / g_addrmap_tbl.free_count_rows;
+	col = base % g_addrmap_tbl.free_count_rows;
+	for (i = 0; i < g_addrmap_tbl.free_count_rows; i++) {
+		if (g_addrmap_tbl.free_count[row] > 0)
+			break;
+		row = (row + 1) & (g_addrmap_tbl.free_count_rows - 1);
+	}
+	for (i = 0; i < tot_cols; i++) {
+		struct in_addr __assigned;
+		__assigned.s_addr = htonl(ntohl(gcfg.dynamic_pool.s_addr) +
+			(u32)tot_cols * row + col);
+		if (!is_ip4_assigned(&__assigned)) {
+			assigned_ip4 = __assigned;
+			break;
+		}
+		col = (col + 1) & (tot_cols - 1);
+	}
+	if (assigned_ip4.s_addr == 0) {
+		/* No free address */
+		/* NOTICE: We can free address of the oldest map and use it */
+		printk(KERN_WARNING "tayga: No free IPv4 address in pool.\n");
 		return -1;
 	}
 
-	if (gcfg->cache_size) {
-		c = cache_insert(addr4, addr6, hash_ip4(addr4), hash);
-
-		if (c_ptr)
-			*c_ptr = c;
-		if (d) {
-			d->cache_entry = c;
-			if (c)
-				c->flags |= CACHE_F_REP_AGEOUT;
-		}
+	/* Allocate new entry and add to hash tables */
+	if (!(map = alloc_addrmap(addr6, &assigned_ip4))) {
+		spin_unlock_bh(&bucket6->lock);
+		return -1;
 	}
+
+	/* Consume the allocated IP address */
+	consume_dynamic_ip(&assigned_ip4);
+
+	bucket4 = &g_addrmap_tbl.base4[hash_ip4(&assigned_ip4) &
+		(g_addrmap_tbl.hash_size - 1)];
+	map->bucket6 = bucket6;
+	map->bucket4 = bucket4;
+	list_add_rcu(&map->list6, &bucket6->chain);
+	list_add_rcu(&map->list4, &bucket4->chain);
+	//touch_addrmap(map);
+
+	spin_lock_bh(&g_addrmap_tbl.idle_lock);
+	list_add_rcu(&map->idle_list, &g_addrmap_tbl.idle_queue);
+	spin_unlock_bh(&g_addrmap_tbl.idle_lock);
+
+	spin_unlock_bh(&bucket6->lock);
+
+	*addr4 = assigned_ip4;
+
+	printk(KERN_INFO "tayga: New address mapping: %s to %s\n",
+			simple_inet6_ntoa(addr6, s_addr6),
+			simple_inet_ntoa(addr4, s_addr4));
 
 	return 0;
 }
 
-static void report_ageout(struct cache_entry *c)
+static int recycle_kthread(void *data)
 {
-	struct map4 *m4;
-	struct map_dynamic *d;
+	struct addrmap_table *tbl = data;
+	struct addrmap_bucket *bucket4, *bucket6;
+	struct addrmap *map;
 
-	m4 = find_map4(&c->addr4);
-	if (!m4 || m4->type != MAP_TYPE_DYNAMIC_HOST)
-		return;
-	d = container_of(m4, struct map_dynamic, map4);
-	d->last_use = c->last_use;
-	d->cache_entry = NULL;
+	set_current_state(TASK_RUNNING);
+	while (!kthread_should_stop()) {
+		if (!list_empty(&tbl->idle_queue)) {
+			spin_lock_bh(&tbl->idle_lock);
+			while (!list_empty(&tbl->idle_queue)) {
+				map = list_first_entry(&tbl->idle_queue,
+						struct addrmap, idle_list);
+
+				if (jiffies - map->last_use <= HZ * gcfg.dynamic_pool_timeo)
+					break;
+
+				bucket6 = map->bucket6;
+				bucket4 = map->bucket4;
+
+				/*
+				 * NOTICE: __trylock__ MUST be used instead of __lock__,
+				 *  otherwise it may stuck while racing the two locks!
+				 */
+				if (!spin_trylock_bh(&bucket6->lock)) {
+					spin_unlock_bh(&tbl->idle_lock);
+					/* ----------------------- */
+					goto skip;
+				}
+				if (!spin_trylock_bh(&bucket4->lock)) {
+					spin_unlock_bh(&bucket6->lock);
+					spin_unlock_bh(&tbl->idle_lock);
+					/* ----------------------- */
+					goto skip;
+				}
+				
+				/* NOTICE: Now we get 3 locks, safe to operate */
+				list_del(&map->idle_list);
+				spin_unlock_bh(&tbl->idle_lock);
+				/* ----------------------- */
+				list_del_rcu(&map->list6);
+				list_del_rcu(&map->list4);
+				spin_unlock_bh(&bucket4->lock);
+				spin_unlock_bh(&bucket6->lock);
+				
+				free_addrmap_rcu(map);
+skip:
+				cond_resched();
+				/* ----------------------- */
+				spin_lock_bh(&tbl->idle_lock);
+			}
+			spin_unlock_bh(&tbl->idle_lock);
+		}
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(HZ * 5);
+		set_current_state(TASK_RUNNING);
+	}
+	set_current_state(TASK_RUNNING);
+
+	return 0;
 }
 
-void addrmap_maint(void)
-{
-	struct list_head *entry, *next;
-	struct cache_entry *c;
+static struct task_struct *g_recycle_task = NULL;
 
-	list_for_each_safe(entry, next, &gcfg->cache_active) {
-		c = list_entry(entry, struct cache_entry, list);
-		if (c->last_use + CACHE_MAX_AGE < now) {
-			if (c->flags & CACHE_F_REP_AGEOUT)
-				report_ageout(c);
-			list_add(&c->list, &gcfg->cache_pool);
-			list_del(&c->hash4);
-			list_del(&c->hash6);
+int init_addrmap(void)
+{
+	int rv = 0, i;
+	size_t __row_bits, __col_bits;
+
+	g_addrmap_tbl.hash_size = 1 << ADDRMAP_HASH_BITS;
+
+	/* Hash able */
+	for (i = 0; i < g_addrmap_tbl.hash_size; i++) {
+		INIT_LIST_HEAD(&g_addrmap_tbl.base4[i].chain);
+		spin_lock_init(&g_addrmap_tbl.base4[i].lock);
+		INIT_LIST_HEAD(&g_addrmap_tbl.base6[i].chain);
+		spin_lock_init(&g_addrmap_tbl.base6[i].lock);
+	}
+	INIT_LIST_HEAD(&g_addrmap_tbl.idle_queue);
+	spin_lock_init(&g_addrmap_tbl.idle_lock);
+
+	/* Free address count of sectioned pool space */
+	__col_bits = (32 - gcfg.dynamic_pfxlen) / 2;
+	__row_bits = (32 - gcfg.dynamic_pfxlen) - __col_bits;
+	g_addrmap_tbl.free_count_rows = 1 << __row_bits;
+	g_addrmap_tbl.free_count = kmalloc(
+			sizeof(size_t) * g_addrmap_tbl.free_count_rows, GFP_KERNEL);
+	if (!g_addrmap_tbl.free_count) {
+		rv = -ENOMEM;
+		goto err3;
+	}
+	for (i = 0; i < g_addrmap_tbl.free_count_rows; i++)
+		g_addrmap_tbl.free_count[i] = 1 << __col_bits;
+
+	/* Start the recycling thread */
+	g_recycle_task = kthread_create(recycle_kthread, &g_addrmap_tbl, "ktayga");
+	if (g_recycle_task)
+		wake_up_process(g_recycle_task);
+
+	return 0;
+err3:
+	return rv;
+}
+
+void fini_addrmap(void)
+{
+	struct addrmap *map, *__nmap;
+	int i;
+
+	if (g_recycle_task)
+		kthread_stop(g_recycle_task);
+
+	for (i = 0; i < g_addrmap_tbl.hash_size; i++) {
+		list_for_each_entry_safe (map, __nmap,
+			&g_addrmap_tbl.base6[i].chain, list6) {
+			list_del(&map->list6);
+			list_del(&map->list4);
+			list_del(&map->idle_list);
+			free_addrmap(map);
 		}
 	}
+	kfree(g_addrmap_tbl.free_count);
 }
+
