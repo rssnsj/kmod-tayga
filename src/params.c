@@ -47,7 +47,7 @@ int validate_ip4_addr(const struct in_addr *a)
 int validate_ip6_addr(const struct in6_addr *a)
 {
 	/* Well-known prefix for NAT64 */
-	if (a->s6_addr32[0] == WKPF && !a->s6_addr32[1] && !a->s6_addr32[2])
+	if (a->s6_addr32[0] == WKPF && a->s6_addr32[1] == 0)
 		return 0;
 
 	/* Reserved per RFC 2373 */
@@ -206,12 +206,6 @@ static int config_ipv6_addr(const char *arg)
 	if (validate_ip6_addr(&gcfg.local_addr6) < 0) {
 		printk(KERN_ERR "Cannot use reserved address %s in ipv6-addr "
 				"directive, aborting...\n", arg);
-		return -EINVAL;
-	}
-	if (gcfg.local_addr6.s6_addr32[0] == WKPF) {
-		printk(KERN_ERR "Error: ipv6-addr directive cannot contain an "
-				"address in the Well-Known Prefix "
-				"(64:ff9b::/96)\n");
 		return -EINVAL;
 	}
 	return 0;
