@@ -1,0 +1,19 @@
+#!/bin/sh
+
+##
+## Firewall rules appendix
+##
+
+# Essential
+iptables -I FORWARD -i nat64 -j ACCEPT
+ip6tables -I FORWARD -o nat64 -j ACCEPT
+
+# Optional
+iptables -I FORWARD -o nat64 -j ACCEPT
+ip6tables -I FORWARD -i nat64 -j ACCEPT
+iptables -I INPUT -i nat64 -j ACCEPT
+ip6tables -I INPUT -i nat64 -j ACCEPT
+
+# Redirect upstream DNS queries to local DNS64 service
+iptables -t nat -I OUTPUT -d 127.0.10.53 -p udp --dport 53 -j REDIRECT --to 1053
+

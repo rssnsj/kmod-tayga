@@ -23,15 +23,6 @@ else
 	tayga=tayga
 fi
 
-cat <<EOF
-
-iptables -I FORWARD -i nat64 -j ACCEPT
-iptables -I FORWARD -o nat64 -j ACCEPT
-ip6tables -I FORWARD -i nat64 -j ACCEPT
-ip6tables -I FORWARD -o nat64 -j ACCEPT
-
-EOF
-
 set -x
 
 insmod $tayga ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
@@ -40,3 +31,4 @@ insmod $tayga ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
 ip link set nat64 up
 ip addr add $ipv6_prefix:0:ffff:0:1/64 dev nat64
 ip addr add $ipv4_prefix.255.1/16 dev nat64
+
