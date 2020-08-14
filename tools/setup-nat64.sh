@@ -17,9 +17,24 @@ fi
 
 rmmod tayga 2>/dev/null
 
+if [ -f tayga.ko ]; then
+	tayga=tayga.ko
+else
+	tayga=tayga
+fi
+
+cat <<EOF
+
+iptables -I FORWARD -i nat64 -j ACCEPT
+iptables -I FORWARD -o nat64 -j ACCEPT
+ip6tables -I FORWARD -i nat64 -j ACCEPT
+ip6tables -I FORWARD -o nat64 -j ACCEPT
+
+EOF
+
 set -x
 
-insmod tayga.ko ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
+insmod $tayga ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
 	prefix=$ipv6_prefix::/96 dynamic_pool=$ipv4_prefix.0.0/17 || exit 1
 
 ip link set nat64 up
