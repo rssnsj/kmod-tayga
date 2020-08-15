@@ -26,6 +26,19 @@
 #include <linux/sched.h>
 #include "tayga.h"
 
+/* defines for list entry orphan check */
+static inline void __init_orphan_list(struct list_head *e)
+{
+	e->next = LIST_POISON1;
+	e->prev = LIST_POISON2;
+}
+static inline int __is_orphan_list(struct list_head *e)
+{
+	return e->next == LIST_POISON1;
+}
+#define INIT_RCU_HEAD(p)  ((void)0)
+
+
 #define ADDRMAP_HASH_BITS  14
 
 struct addrmap_bucket {
@@ -102,13 +115,13 @@ static struct addrmap *alloc_addrmap(const struct in6_addr *addr6,
 
 	if (!(map = kmalloc(sizeof(struct addrmap), GFP_ATOMIC)))
 		return NULL;
-	init_list_entry(&map->list4);
-	init_list_entry(&map->list6);
-	init_list_entry(&map->idle_list);
+	__init_orphan_list(&map->list4);
+	__init_orphan_list(&map->list6);
+	__init_orphan_list(&map->idle_list);
 	map->addr6 = *addr6;
 	map->addr4 = *addr4;
 	map->last_use = jiffies;
-	INIT_RCU_HEAD(&map->rcu);	
+	INIT_RCU_HEAD(&map->rcu);
 	return map;
 }
 
@@ -150,7 +163,7 @@ static void touch_addrmap(struct addrmap *map)
 	map->last_use = jiffies;
 	spin_lock_bh(&tbl->idle_lock);
 	/* Might be removed from idle_queue after got from hash table. */
-	if (!list_entry_orphan(&map->idle_list)) {
+	if (!__is_orphan_list(&map->idle_list)) {
 		list_del_rcu(&map->idle_list);
 		list_add_tail_rcu(&map->idle_list, &tbl->idle_queue);
 	}
@@ -502,7 +515,7 @@ skip:
 		}
 
 		set_current_state(TASK_INTERRUPTIBLE);
-		schedule_timeout(HZ * 5);
+		schedule_timeout(HZ * POOL_CHECK_INTERVAL);
 		set_current_state(TASK_RUNNING);
 	}
 	set_current_state(TASK_RUNNING);

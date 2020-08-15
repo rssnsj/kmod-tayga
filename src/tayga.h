@@ -33,16 +33,10 @@
 /* Configuration knobs */
 
 /* Number of seconds of silence before a map ages out of the cache */
-#define CACHE_MAX_AGE		(HZ * 120)
-
-/* Number of seconds between cache ageing passes */
-#define CACHE_CHECK_INTERVAL	(HZ * 5)
+#define CACHE_MAX_AGE		(120)
 
 /* Number of seconds between dynamic pool ageing passes */
-#define POOL_CHECK_INTERVAL	(HZ * 5)
-
-/* Valid token delimiters in config file and dynamic map file */
-#define DELIM		" \t\r\n"
+#define POOL_CHECK_INTERVAL	(5)
 
 
 /* Protocol structures */
@@ -133,12 +127,9 @@ struct config {
 
 	unsigned long dynamic_pool_timeo;
 
-	//struct list_head map4_list;
-	//struct list_head map6_list;
 	int dyn_min_lease;
 	int dyn_max_lease;
 	int max_commit_delay;
-	//struct dynamic_pool *dynamic_pool;
 	int hash_bits;
 	//int cache_size;
 	int allow_ident_gen;
@@ -148,10 +139,6 @@ struct config {
 	u16 mtu;
 
 	u32 rand[8];
-
-	unsigned long last_dynamic_maint;
-	unsigned long last_map_write;
-	int map_write_pending;
 };
 
 
@@ -214,17 +201,6 @@ void handle_ip4(struct pkt *p);
 void handle_ip6(struct pkt *p);
 
 /* utilities */
-static inline void init_list_entry(struct list_head *entry)
-{
-	entry->next = LIST_POISON1;
-	entry->prev = LIST_POISON2;
-}
-static inline int list_entry_orphan(struct list_head *entry)
-{
-	return entry->next == LIST_POISON1;
-}
-
-#define INIT_RCU_HEAD(p)  ((void)0)
 
 static inline char *simple_inet6_ntoa(const struct in6_addr *a, char *s)
 {
