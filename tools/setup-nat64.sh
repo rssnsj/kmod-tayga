@@ -3,9 +3,11 @@
 if [ "$1" = -a ]; then
 	ipv6_subnet="64:ff9b:0:0::/64"
 	ipv4_subnet="10.40.0.0/16"
-elif [ $# -eq 2 ]; then
+elif [ $# -ge 2 ]; then
 	ipv6_subnet="$1"
 	ipv4_subnet="$2"
+	shift 2
+	more_params="$*"
 else
 	cat <<EOF
 Usage:
@@ -42,7 +44,8 @@ fi
 set -x
 
 insmod $tayga ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
-	prefix=$ipv6_prefix::/96 dynamic_pool=$ipv4_prefix.0.0/17 || exit 1
+	prefix=$ipv6_prefix::/96 dynamic_pool=$ipv4_prefix.0.0/17 \
+	$more_params || exit 1
 
 ip link set nat64 up
 ip addr add $ipv6_prefix:0:ffff:0:1/64 dev nat64

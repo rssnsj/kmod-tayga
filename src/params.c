@@ -267,7 +267,12 @@ MODULE_PARM_DESC(prefix, "NAT64 IPv6 prefix");
 
 static char s_dynamic_pool[20];
 module_param_string(dynamic_pool, s_dynamic_pool, sizeof(s_dynamic_pool), 0644);
-MODULE_PARM_DESC(dynamic_pool, "Dynamic address pool");
+MODULE_PARM_DESC(dynamic_pool, "dynamic address map pool");
+
+/* Number of seconds of silence before a map ages out of the cache */
+static unsigned cache_age = 120;
+module_param(cache_age, uint, 0644);
+MODULE_PARM_DESC(cache_age, "address map timeout (seconds)");
 
 int check_params(void)
 {
@@ -279,7 +284,12 @@ int check_params(void)
 	gcfg.allow_ident_gen = 1;
 	gcfg.ipv6_offlink_mtu = 1280;
 	gcfg.lazy_frag_hdr = 1;
-	gcfg.dynamic_pool_timeo = CACHE_MAX_AGE;
+
+	if (cache_age < 5) {
+		printk(KERN_ERR "Too short timeout, expecting cache_age >= 5\n");
+		return -EINVAL;
+	}
+	gcfg.dynamic_pool_timeo = cache_age;
 
 	if ((rc = config_ipv6_addr(s_ipv6_addr)) < 0)
 		return rc;
@@ -291,7 +301,7 @@ int check_params(void)
 		return rc;
 
 	if (!gcfg.local_addr4.s_addr) {
-		printk(KERN_ERR "Error: no ipv4-addr directive found\n");
+		printk(KERN_ERR "No ipv4-addr directive found\n");
 		return -EINVAL;
 	}
 

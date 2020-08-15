@@ -30,11 +30,6 @@
 		&& __a->s6_addr32[3] == __b->s6_addr32[3]; }))
 #endif
 
-/* Configuration knobs */
-
-/* Number of seconds of silence before a map ages out of the cache */
-#define CACHE_MAX_AGE		(120)
-
 /* Number of seconds between dynamic pool ageing passes */
 #define POOL_CHECK_INTERVAL	(5)
 
