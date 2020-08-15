@@ -1,7 +1,23 @@
 #!/bin/sh
 
-ipv6_subnet="$1"
-ipv4_subnet="$2"
+if [ "$1" = -a ]; then
+	ipv6_subnet="64:ff9b:0:0::/64"
+	ipv4_subnet="10.40.0.0/16"
+elif [ $# -eq 2 ]; then
+	ipv6_subnet="$1"
+	ipv4_subnet="$2"
+else
+	cat <<EOF
+Usage:
+  setup-nat64.sh <IPv6 subnet> <IPv4 subnet>    setup with specified prefixes
+  setup-nat64.sh -a                             use default setup
+Note:
+  IPv6 subnet must be /64, IPv4 subnet must be /16
+Example:
+  setup-nat64.sh 2001:db8:0:0::/64 10.10.0.0/16
+EOF
+	exit 1
+fi
 
 ipv6_prefix=`expr "$ipv6_subnet" : '\([^:]\+:[^:]\+:[^:]\+:[^:]\+\)::\/64$'`
 if [ -z "$ipv6_prefix" ]; then
