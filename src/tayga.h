@@ -19,6 +19,7 @@
 #include <linux/in6.h>
 #include <linux/list.h>
 #include <linux/netdevice.h>
+#include <linux/proc_fs.h>
 
 #ifndef IN6_ARE_ADDR_EQUAL
 #define IN6_ARE_ADDR_EQUAL(a,b)  (__extension__  \
@@ -186,6 +187,7 @@ static inline int map_ip6_to_ip4(struct in_addr *addr4, const struct in6_addr *a
 int init_addrmap(void);
 void fini_addrmap(void);
 
+extern struct proc_dir_entry *g_tayga_proc_dir;
 
 /* conffile.c */
 extern struct config gcfg;

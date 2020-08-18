@@ -24,7 +24,6 @@
 #include <linux/netdevice.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
-#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include "tayga.h"
 
@@ -73,7 +72,6 @@ struct addrmap {
 
 static struct addrmap_table g_addrmap_tbl;
 static struct task_struct *g_recycle_task = NULL;
-static struct proc_dir_entry *g_proc_dir;
 
 static inline u32 hash_ip4(const struct in_addr *addr4)
 {
@@ -592,8 +590,7 @@ int init_addrmap(void)
 	if (g_recycle_task)
 		wake_up_process(g_recycle_task);
 
-	g_proc_dir = proc_mkdir("tayga", NULL);
-	proc_create_data("addrmap", 0644, g_proc_dir, &addrmap_proc_fops, NULL);
+	proc_create_data("addrmap", 0644, g_tayga_proc_dir, &addrmap_proc_fops, NULL);
 
 	return 0;
 err3:
@@ -605,8 +602,7 @@ void fini_addrmap(void)
 	struct addrmap *map, *__nmap;
 	int i;
 
-	remove_proc_entry("addrmap", g_proc_dir);
-	remove_proc_entry("tayga", NULL);
+	remove_proc_entry("addrmap", g_tayga_proc_dir);
 
 	if (g_recycle_task)
 		kthread_stop(g_recycle_task);

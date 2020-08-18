@@ -110,13 +110,16 @@ static void nat64_setup(struct net_device *dev)
 }
 
 /* Handle of the NAT64 virtual interface */
-static struct net_device *nat64_netdev = NULL;
+static struct net_device *nat64_netdev;
+struct proc_dir_entry *g_tayga_proc_dir;
 
 int  __init nat64_module_init(void)
 {
 	struct net_device *dev;
 	char s_addr4[20], s_addr6[64];
 	int err = -1;
+
+	g_tayga_proc_dir = proc_mkdir("tayga", NULL);
 
 	if ((err = check_params()) < 0)
 		goto err1;
@@ -157,6 +160,7 @@ err3:
 err2:
 	/* fini_config() */
 err1:
+	remove_proc_entry("tayga", NULL);
 	return err;
 }
 
@@ -166,6 +170,7 @@ void __exit nat64_module_exit(void)
 	free_netdev(nat64_netdev);
 	/* fini_config() */
 	fini_addrmap();
+	remove_proc_entry("tayga", NULL);
 }
 
 module_init(nat64_module_init);
