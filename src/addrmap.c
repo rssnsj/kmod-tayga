@@ -24,6 +24,8 @@
 #include <linux/netdevice.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include "tayga.h"
 
 /* defines for list entry orphan check */
@@ -70,6 +72,8 @@ struct addrmap {
 };
 
 static struct addrmap_table g_addrmap_tbl;
+static struct task_struct *g_recycle_task = NULL;
+static struct proc_dir_entry *g_proc_dir;
 
 static inline u32 hash_ip4(const struct in_addr *addr4)
 {
@@ -358,7 +362,7 @@ int __map_ip6_to_ip4(struct in_addr *addr4,
 	struct addrmap_bucket *bucket6, *bucket4;
 	struct in_addr assigned_ip4 = { 0 };
 	int i, row, col, tot_cols;
-	char s_addr4[20], s_addr6[40];
+	char s_addr4[20], s_addr6[64];
 
 	/* NAT64 address conversion */
 	if (IN6_IS_IN_NET(addr6, &gcfg.prefix, &gcfg.prefix_mask)) {
@@ -471,8 +475,7 @@ static int recycle_kthread(void *data)
 		if (!list_empty(&tbl->idle_queue)) {
 			spin_lock_bh(&tbl->idle_lock);
 			while (!list_empty(&tbl->idle_queue)) {
-				map = list_first_entry(&tbl->idle_queue,
-						struct addrmap, idle_list);
+				map = list_first_entry(&tbl->idle_queue, struct addrmap, idle_list);
 
 				if (jiffies - map->last_use <= HZ * gcfg.dynamic_pool_timeo)
 					break;
@@ -523,7 +526,34 @@ skip:
 	return 0;
 }
 
-static struct task_struct *g_recycle_task = NULL;
+static int addrmap_proc_show(struct seq_file *m, void *v)
+{
+	struct addrmap *map;
+	char s_addr4[20], s_addr6[64];
+
+	seq_printf(m, "ipv6_address\tipv4_address\ttimeout\n");
+
+	list_for_each_entry_rcu (map, &g_addrmap_tbl.idle_queue, idle_list) {
+		seq_printf(m, "%s\t%s\t%lu\n",
+			simple_inet6_ntoa(&map->addr6, s_addr6),
+			simple_inet_ntoa(&map->addr4, s_addr4),
+			gcfg.dynamic_pool_timeo - (jiffies - map->last_use) / HZ);
+	}
+
+	return 0;
+}
+
+static int addrmap_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, addrmap_proc_show, NULL);
+}
+
+static const struct file_operations addrmap_proc_fops = {
+	.open		= addrmap_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
 
 int init_addrmap(void)
 {
@@ -560,6 +590,9 @@ int init_addrmap(void)
 	if (g_recycle_task)
 		wake_up_process(g_recycle_task);
 
+	g_proc_dir = proc_mkdir("tayga", NULL);
+	proc_create_data("addrmap", 0644, g_proc_dir, &addrmap_proc_fops, NULL);
+
 	return 0;
 err3:
 	return rv;
@@ -569,6 +602,9 @@ void fini_addrmap(void)
 {
 	struct addrmap *map, *__nmap;
 	int i;
+
+	remove_proc_entry("addrmap", g_proc_dir);
+	remove_proc_entry("tayga", NULL);
 
 	if (g_recycle_task)
 		kthread_stop(g_recycle_task);

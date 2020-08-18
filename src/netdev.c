@@ -115,7 +115,7 @@ static struct net_device *nat64_netdev = NULL;
 int  __init nat64_module_init(void)
 {
 	struct net_device *dev;
-	char s_addr4[20], s_addr6[40];
+	char s_addr4[20], s_addr6[64];
 	int err = -1;
 
 	if ((err = check_params()) < 0)
