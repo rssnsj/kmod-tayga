@@ -159,7 +159,7 @@ static void touch_addrmap(struct addrmap *map)
 	struct addrmap_table *tbl = &g_addrmap_tbl;
 
 	/* Update its idle_list order with minimum interval: 5s */
-	if (jiffies - map->last_use < HZ * 5)
+	if (time_before(jiffies, map->last_use + HZ * 5))
 		return;
 
 	map->last_use = jiffies;
@@ -475,7 +475,7 @@ static int recycle_kthread(void *data)
 			while (!list_empty(&tbl->idle_queue)) {
 				map = list_first_entry(&tbl->idle_queue, struct addrmap, idle_list);
 
-				if (jiffies - map->last_use <= HZ * gcfg.dynamic_pool_timeo)
+				if (time_before(jiffies, map->last_use + HZ * gcfg.dynamic_pool_timeo))
 					break;
 
 				bucket6 = map->bucket6;
@@ -536,7 +536,7 @@ static int addrmap_proc_show(struct seq_file *m, void *v)
 		seq_printf(m, "%s\t%s\t%lu\n",
 			simple_inet6_ntoa(&map->addr6, s_addr6),
 			simple_inet_ntoa(&map->addr4, s_addr4),
-			gcfg.dynamic_pool_timeo - (jiffies - map->last_use) / HZ);
+			(long)gcfg.dynamic_pool_timeo - (long)(jiffies - map->last_use) / HZ);
 	}
 	spin_unlock_bh(&g_addrmap_tbl.idle_lock);
 
