@@ -448,7 +448,7 @@ int __map_ip6_to_ip4(struct in_addr *addr4,
 	//touch_addrmap(map);
 
 	spin_lock_bh(&g_addrmap_tbl.idle_lock);
-	list_add_rcu(&map->idle_list, &g_addrmap_tbl.idle_queue);
+	list_add_tail_rcu(&map->idle_list, &g_addrmap_tbl.idle_queue);
 	spin_unlock_bh(&g_addrmap_tbl.idle_lock);
 
 	spin_unlock_bh(&bucket6->lock);
@@ -533,10 +533,11 @@ static int addrmap_proc_show(struct seq_file *m, void *v)
 
 	spin_lock_bh(&g_addrmap_tbl.idle_lock);
 	list_for_each_entry_reverse (map, &g_addrmap_tbl.idle_queue, idle_list) {
-		seq_printf(m, "%s\t%s\t%lu\n",
+		seq_printf(m, "%s\t%s\t%ld\n",
 			simple_inet6_ntoa(&map->addr6, s_addr6),
 			simple_inet_ntoa(&map->addr4, s_addr4),
-			(long)gcfg.dynamic_pool_timeo - (long)(jiffies - map->last_use) / HZ);
+			(long)gcfg.dynamic_pool_timeo -
+				(long)((unsigned long)jiffies - map->last_use) / HZ);
 	}
 	spin_unlock_bh(&g_addrmap_tbl.idle_lock);
 
