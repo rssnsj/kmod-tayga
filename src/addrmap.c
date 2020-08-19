@@ -40,7 +40,7 @@ static inline int __is_orphan_list(struct list_head *e)
 #define INIT_RCU_HEAD(p)  ((void)0)
 
 
-#define ADDRMAP_HASH_BITS  14
+#define ADDRMAP_HASH_SIZE  (1 << 8)
 
 struct addrmap_bucket {
 	struct list_head chain;
@@ -48,9 +48,8 @@ struct addrmap_bucket {
 };
 
 struct addrmap_table {
-	struct addrmap_bucket base4[1 << ADDRMAP_HASH_BITS];
-	struct addrmap_bucket base6[1 << ADDRMAP_HASH_BITS];
-	size_t hash_size;
+	struct addrmap_bucket base4[ADDRMAP_HASH_SIZE];
+	struct addrmap_bucket base6[ADDRMAP_HASH_SIZE];
 	struct list_head idle_queue;
 	spinlock_t idle_lock;
 	/* Number of unassigned IPv4 addresses in divided sections */
@@ -175,7 +174,7 @@ static void touch_addrmap(struct addrmap *map)
 static bool is_ip4_assigned(const struct in_addr *addr4)
 {
 	struct addrmap_bucket *bucket4 = &g_addrmap_tbl.base4[
-		hash_ip4(addr4) & (g_addrmap_tbl.hash_size - 1)];
+			hash_ip4(addr4) & (ADDRMAP_HASH_SIZE - 1)];
 	struct addrmap *map;
 	
 	list_for_each_entry_rcu (map, &bucket4->chain, list4) {
@@ -339,8 +338,7 @@ int __map_ip4_to_ip6(struct in6_addr *addr6, const struct in_addr *addr4)
 	if (!IN4_IS_IN_NET(addr4, &gcfg.dynamic_pool, &gcfg.dynamic_mask))
 		return append_to_prefix(addr6, addr4, &gcfg.prefix, gcfg.prefix_len);
 
-	bucket4 = &g_addrmap_tbl.base4[hash_ip4(addr4) &
-			(g_addrmap_tbl.hash_size - 1)];
+	bucket4 = &g_addrmap_tbl.base4[hash_ip4(addr4) & (ADDRMAP_HASH_SIZE - 1)];
 	list_for_each_entry_rcu (map, &bucket4->chain, list4) {
 		if (addr4->s_addr == map->addr4.s_addr) {
 			*addr6 = map->addr6;
@@ -373,8 +371,8 @@ int __map_ip6_to_ip4(struct in_addr *addr4,
 		return -1;
 
 	/* Search in dynamic pool hash table */
-	bucket6 = &g_addrmap_tbl.base6[hash_ip6(addr6) &
-		(g_addrmap_tbl.hash_size - 1)];
+	bucket6 = &g_addrmap_tbl.base6[hash_ip6(addr6) & (ADDRMAP_HASH_SIZE - 1)];
+
 	list_for_each_entry_rcu (map, &bucket6->chain, list6) {
 		if (IN6_ARE_ADDR_EQUAL(addr6, &map->addr6)) {
 			*addr4 = map->addr4;
@@ -425,7 +423,7 @@ int __map_ip6_to_ip4(struct in_addr *addr4,
 	}
 	if (assigned_ip4.s_addr == 0) {
 		/* No free address */
-		/* NOTICE: We can free address of the oldest map and use it */
+		/* FIXME: We can free address of the oldest map and use it */
 		printk(KERN_WARNING "tayga: No free IPv4 address in pool.\n");
 		return -1;
 	}
@@ -439,13 +437,11 @@ int __map_ip6_to_ip4(struct in_addr *addr4,
 	/* Consume the allocated IP address */
 	consume_dynamic_ip(&assigned_ip4);
 
-	bucket4 = &g_addrmap_tbl.base4[hash_ip4(&assigned_ip4) &
-		(g_addrmap_tbl.hash_size - 1)];
+	bucket4 = &g_addrmap_tbl.base4[hash_ip4(&assigned_ip4) & (ADDRMAP_HASH_SIZE - 1)];
 	map->bucket6 = bucket6;
 	map->bucket4 = bucket4;
 	list_add_rcu(&map->list6, &bucket6->chain);
 	list_add_rcu(&map->list4, &bucket4->chain);
-	//touch_addrmap(map);
 
 	spin_lock_bh(&g_addrmap_tbl.idle_lock);
 	list_add_tail_rcu(&map->idle_list, &g_addrmap_tbl.idle_queue);
@@ -561,10 +557,8 @@ int init_addrmap(void)
 	int rv = 0, i;
 	size_t __row_bits, __col_bits;
 
-	g_addrmap_tbl.hash_size = 1 << ADDRMAP_HASH_BITS;
-
 	/* Hash able */
-	for (i = 0; i < g_addrmap_tbl.hash_size; i++) {
+	for (i = 0; i < ADDRMAP_HASH_SIZE; i++) {
 		INIT_LIST_HEAD(&g_addrmap_tbl.base4[i].chain);
 		spin_lock_init(&g_addrmap_tbl.base4[i].lock);
 		INIT_LIST_HEAD(&g_addrmap_tbl.base6[i].chain);
@@ -608,7 +602,7 @@ void fini_addrmap(void)
 	if (g_recycle_task)
 		kthread_stop(g_recycle_task);
 
-	for (i = 0; i < g_addrmap_tbl.hash_size; i++) {
+	for (i = 0; i < ADDRMAP_HASH_SIZE; i++) {
 		list_for_each_entry_safe (map, __nmap,
 			&g_addrmap_tbl.base6[i].chain, list6) {
 			list_del(&map->list6);
