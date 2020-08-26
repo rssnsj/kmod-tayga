@@ -52,7 +52,7 @@ static u16 ip_checksum(void *d, int c)
 	return ~sum;
 }
 
-static u16 ones_add(u16 a, u16 b)
+static inline u16 ones_add(u16 a, u16 b)
 {
 	u32 sum = (u16)~a + (u16)~b;
 
@@ -102,7 +102,7 @@ static u16 select_ip4_ipid(void)
 	static DEFINE_SPINLOCK(ipid_lock);
 	static u32 offset = 0;
 	u32 ipid;
-	
+
 	spin_lock_bh(&ipid_lock);
 	ipid = gcfg.rand[0] + offset++;
 	spin_unlock_bh(&ipid_lock);
@@ -121,8 +121,7 @@ static void host_send_icmp4(u8 tos, struct in_addr *src,
 
 	header.ip4.ver_ihl = 0x45;
 	header.ip4.tos = tos;
-	header.ip4.length = htons(sizeof(header.ip4) + sizeof(header.icmp) +
-				data_len);
+	header.ip4.length = htons(sizeof(header.ip4) + sizeof(header.icmp) + data_len);
 	header.ip4.ident = select_ip4_ipid();
 	header.ip4.flags_offset = 0;
 	header.ip4.ttl = 64;
@@ -204,8 +203,7 @@ static int xlate_payload_4to6(struct pkt *p, struct ip6 *ip6)
 
 	switch (p->data_proto) {
 	case 1:
-		cksum = ip6_checksum(ip6, ntohs(p->ip4->length) -
-						p->header_len, 58);
+		cksum = ip6_checksum(ip6, ntohs(p->ip4->length) - p->header_len, 58);
 		cksum = ones_add(swap_u16(ntohs(p->icmp->cksum)), cksum);
 		if (p->icmp->type == 8) {
 			p->icmp->type = 128;
@@ -272,8 +270,7 @@ static void xlate_4to6_data(struct pkt *p)
 	if ((off & (IP4_F_MASK | IP4_F_MF)) == 0) {
 		if (off & IP4_F_DF) {
 			if (gcfg.mtu - MTU_ADJ < p->header_len + p->data_len) {
-				host_send_icmp4_error(3, 4,
-						gcfg.mtu - MTU_ADJ, p);
+				host_send_icmp4_error(3, 4, gcfg.mtu - MTU_ADJ, p);
 				goto drop_skb;
 			}
 			no_frag_hdr = 1;
@@ -337,8 +334,7 @@ static void xlate_4to6_data(struct pkt *p)
 			p->data_len -= frag_size;
 			off += frag_size;
 
-			if (p->data_len || (p->ip4->flags_offset &
-							htons(IP4_F_MF)))
+			if (p->data_len || (p->ip4->flags_offset & htons(IP4_F_MF)))
 				header.ip6_frag.offset_flags |= htons(IP6_F_MF);
 
 			new_skb = netdev_alloc_skb(p->dev, sizeof(header) + frag_size);
@@ -373,7 +369,8 @@ static int parse_ip4(struct pkt *p)
 
 	p->header_len = (p->ip4->ver_ihl & 0x0f) * 4;
 
-	if ((p->ip4->ver_ihl >> 4) != 4 || p->header_len < sizeof(struct ip4) ||
+	if ((p->ip4->ver_ihl >> 4) != 4 ||
+			p->header_len < sizeof(struct ip4) ||
 			p->data_len < p->header_len ||
 			ntohs(p->ip4->length) < p->header_len ||
 			validate_ip4_addr(&p->ip4->src) ||
@@ -455,11 +452,10 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 		return;
 
 	if (sizeof(struct ip6) * 2 + sizeof(struct icmp) + p_em.data_len > 1280)
-		p_em.data_len = 1280 - sizeof(struct ip6) * 2 -
-						sizeof(struct icmp);
+		p_em.data_len = 1280 - sizeof(struct ip6) * 2 - sizeof(struct icmp);
 
 	if (map_ip4_to_ip6(&header.ip6_em.src, &p_em.ip4->src) ||
-		map_ip4_to_ip6(&header.ip6_em.dest, &p_em.ip4->dest))
+			map_ip4_to_ip6(&header.ip6_em.dest, &p_em.ip4->dest))
 		return;
 
 	xlate_header_4to6(&p_em, &header.ip6_em,
@@ -549,12 +545,12 @@ static void xlate_4to6_icmp_error(struct pkt *p)
 	--header.ip6.hop_limit;
 
 	header.icmp.cksum = 0;
-	header.icmp.cksum = htons(swap_u16(ones_add(ip6_checksum(&header.ip6,
-					ntohs(header.ip6.payload_length), 58),
-			ones_add(ip_checksum(&header.icmp,
-						sizeof(header.icmp) +
+	header.icmp.cksum = htons(swap_u16(ones_add(
+			ip6_checksum(&header.ip6, ntohs(header.ip6.payload_length), 58),
+			ones_add(ip_checksum(&header.icmp, sizeof(header.icmp) +
 						sizeof(header.ip6_em)),
-				ip_checksum(p_em.data, p_em.data_len)))));
+					ip_checksum(p_em.data, p_em.data_len))
+			)));
 
 	skb = netdev_alloc_skb(p->dev, sizeof(header) + p_em.data_len);
 	if (!skb) {
@@ -631,8 +627,7 @@ static void host_send_icmp6(u8 tc, struct in6_addr *src,
 	header.icmp.cksum = htons(swap_u16(ones_add(ip_checksum(data, data_len),
 			ip_checksum(&header.icmp, sizeof(header.icmp)))));
 	header.icmp.cksum = htons(swap_u16(ones_add(swap_u16(ntohs(header.icmp.cksum)),
-			ip6_checksum(&header.ip6,
-					data_len + sizeof(header.icmp), 58))));
+			ip6_checksum(&header.ip6, data_len + sizeof(header.icmp), 58))));
 
 	skb = netdev_alloc_skb(dev, sizeof(header) + data_len);
 	if (!skb) {

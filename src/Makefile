@@ -14,7 +14,7 @@ tayga.ko: netdev.c tayga.h nat64.c params.c addrmap.c
 	$(MAKE) -C $(KERNSRC) M=$(shell pwd) modules
 
 clean:
-	rm -rf .tmp_versions *.o *.ko .*.cmd .*.d *.mod *.mod.c *.symvers modules.order *\~
+	rm -rf .tmp_versions *.o *.ko .*.cmd .*.d *.mod *.mod.c *.symvers modules.order .cache.mk *\~
 
 install: tayga.ko
 	cp -f tayga.ko /lib/modules/$(shell uname -r)/kernel/
