@@ -36,14 +36,14 @@ fi
 rmmod tayga 2>/dev/null
 
 if [ -f tayga.ko ]; then
-	tayga=tayga.ko
+	module=tayga.ko
 else
-	tayga=tayga
+	module=tayga
 fi
 
 set -x
 
-insmod $tayga ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
+insmod $module ipv6_addr=$ipv6_prefix:0:ffff:0:2 ipv4_addr=$ipv4_prefix.255.2 \
 	prefix=$ipv6_prefix::/96 dynamic_pool=$ipv4_prefix.0.0/17 \
 	$more_params || exit 1
 
